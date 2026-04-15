@@ -1,0 +1,447 @@
+import express, { Request, Response, NextFunction } from 'express';
+import cors from 'cors';
+import { pool } from './db';
+import dotenv from 'dotenv';
+import multer from 'multer';
+import path from 'path';
+import fs from 'fs';
+import jwt from 'jsonwebtoken';
+import { z } from 'zod';
+import { verifyJWT, AuthRequest } from './auth';
+
+dotenv.config();
+
+const JWT_SECRET = process.env.jwt_secret || 'caduemaria2';
+
+// --- MIGRAÇÃO AUTOMÁTICA DO BANCO ---
+const migrateDB = async () => {
+  try {
+    // 1. Tabelas Base e Colunas
+    await pool.query('ALTER TABLE clientes ADD COLUMN IF NOT EXISTS atendente_id INTEGER REFERENCES usuarios(id)');
+    await pool.query('ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS meta_faturamento DECIMAL(12, 2) DEFAULT 0.00');
+    
+    // 2. Criar Transações se não existir
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS transacoes (
+        id SERIAL PRIMARY KEY,
+        cliente_id INTEGER REFERENCES clientes(id) ON DELETE SET NULL,
+        descricao TEXT NOT NULL,
+        valor DECIMAL(12, 2) NOT NULL,
+        tipo VARCHAR(20) NOT NULL CHECK (tipo IN ('Entrada', 'Saída')),
+        data_transacao TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // 3. Atualizar Enums e Colunas de Refatoração (Modernização para TEXT)
+    await pool.query(`
+        DO $$ 
+        BEGIN
+            -- Garantir que status_caso seja VARCHAR em vez de ENUM para flexibilidade
+            IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'clientes' AND column_name = 'status_caso') THEN
+                ALTER TABLE clientes ALTER COLUMN status_caso TYPE VARCHAR(100);
+            ELSE
+                ALTER TABLE clientes ADD COLUMN status_caso VARCHAR(100) DEFAULT 'Triagem';
+            END IF;
+
+            -- Garantir que outras colunas também sejam texto flexível
+            ALTER TABLE clientes ALTER COLUMN categoria_servico TYPE VARCHAR(100);
+            ALTER TABLE clientes ALTER COLUMN status_pagamento TYPE VARCHAR(100);
+
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'documentos' AND column_name = 'arquivo_binario') THEN
+                ALTER TABLE documentos ADD COLUMN arquivo_binario BYTEA;
+                ALTER TABLE documentos ADD COLUMN mime_type VARCHAR(100);
+            END IF;
+            IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'logs_atividades' AND column_name = 'dados_antigos') THEN
+                ALTER TABLE logs_atividades ADD COLUMN dados_antigos JSONB;
+                ALTER TABLE logs_atividades ADD COLUMN dados_novos JSONB;
+            END IF;
+
+            -- Recriar Trigger de Auditoria para capturar snapshots JSONB
+            DROP TRIGGER IF EXISTS trg_log_clientes ON clientes;
+            DROP TRIGGER IF EXISTS trg_log_documentos ON documentos;
+            DROP TRIGGER IF EXISTS trg_log_transacoes ON transacoes;
+
+            CREATE OR REPLACE FUNCTION fn_registrar_log()
+            RETURNS TRIGGER AS $$
+            DECLARE
+                v_perfil VARCHAR(50);
+                v_usuario_id INTEGER;
+            BEGIN
+                BEGIN
+                    v_usuario_id := current_setting('app.current_user_id', true)::INTEGER;
+                EXCEPTION WHEN OTHERS THEN RETURN NEW;
+            END;
+            IF v_usuario_id IS NOT NULL THEN
+                SELECT perfil INTO v_perfil FROM usuarios WHERE id = v_usuario_id;
+                IF v_perfil IN ('Admin', 'Atendente') THEN
+                    IF (TG_OP = 'DELETE') THEN
+                        INSERT INTO logs_atividades (usuario_id, acao, tabela_afetada, dados_antigos)
+                        VALUES (v_usuario_id, TG_OP, TG_TABLE_NAME, row_to_json(OLD));
+                    ELSIF (TG_OP = 'UPDATE') THEN
+                        INSERT INTO logs_atividades (usuario_id, acao, tabela_afetada, dados_antigos, dados_novos)
+                        VALUES (v_usuario_id, TG_OP, TG_TABLE_NAME, row_to_json(OLD), row_to_json(NEW));
+                    ELSIF (TG_OP = 'INSERT') THEN
+                        INSERT INTO logs_atividades (usuario_id, acao, tabela_afetada, dados_novos)
+                        VALUES (v_usuario_id, TG_OP, TG_TABLE_NAME, row_to_json(NEW));
+                    END IF;
+                END IF;
+            END IF;
+            IF (TG_OP = 'DELETE') THEN RETURN OLD; END IF;
+            RETURN NEW;
+            END; $$ LANGUAGE plpgsql;
+
+            CREATE TRIGGER trg_log_clientes AFTER INSERT OR UPDATE OR DELETE ON clientes FOR EACH ROW EXECUTE FUNCTION fn_registrar_log();
+            CREATE TRIGGER trg_log_documentos AFTER INSERT OR UPDATE OR DELETE ON documentos FOR EACH ROW EXECUTE FUNCTION fn_registrar_log();
+            CREATE TRIGGER trg_log_transacoes AFTER INSERT OR UPDATE OR DELETE ON transacoes FOR EACH ROW EXECUTE FUNCTION fn_registrar_log();
+        END $$;
+    `);
+
+    console.log('✅ Migração de Banco Concluída (Auditoria JSONB & BYTEA)');
+  } catch (err) {
+    console.error('❌ Erro na migração:', err);
+  }
+};
+migrateDB();
+
+const app = express();
+const port = 3001;
+
+// Configuração do Multer para Memória (Postgres BYTEA)
+const storage = multer.memoryStorage();
+const upload = multer({ storage: storage });
+
+app.use(cors());
+app.use(express.json());
+
+// --- SCHEMAS DE VALIDAÇÃO (ZOD) ---
+const clienteSchema = z.object({
+  nome_completo: z.string().min(3),
+  cpf: z.string().regex(/^\d{3}\.\d{3}\.\d{3}-\d{2}$|^\d{11}$/),
+  rg: z.string().optional(),
+  telefone_whatsapp: z.string().optional(),
+  puf: z.string().min(1),
+  categoria_servico: z.string(),
+  valor_contrato: z.coerce.number().nonnegative(),
+  status_pagamento: z.string(),
+  status_caso: z.string().optional(),
+  notas: z.string().optional()
+});
+
+// --- ROUTES ---
+
+// 1. Auth Login (JWT)
+app.post('/api/login', async (req: Request, res: Response) => {
+  const { email, senha } = req.body;
+  console.log('Login Attempt:', { email });
+  try {
+    const result = await pool.query(
+      'SELECT id, nome, email, perfil, meta_faturamento FROM usuarios WHERE (email ILIKE $1 OR nome ILIKE $1) AND senha = $2',
+      [email, senha]
+    );
+
+    if (result.rows.length > 0) {
+      const user = result.rows[0];
+      const token = jwt.sign(
+        { id: user.id, email: user.email, perfil: user.perfil },
+        JWT_SECRET,
+        { expiresIn: '8h' }
+      );
+      res.json({ token, user });
+    } else {
+      res.status(401).json({ error: 'Credenciais inválidas' });
+    }
+  } catch (err: unknown) {
+    console.error('Login Error:', err);
+    res.status(500).json({ error: 'Erro no servidor' });
+  }
+});
+
+// A partir daqui todas as rotas precisam de JWT
+app.use(verifyJWT as any);
+
+// 2. Clientes CRUD
+app.get('/api/clientes', async (req: AuthRequest, res: Response) => {
+  try {
+    const { search } = req.query;
+    const userId = req.user?.id;
+    const userProfile = req.user?.perfil;
+
+    console.log('--- FETCH CLIENTES ---');
+    console.log('User:', { userId, userProfile });
+    console.log('Search:', search);
+
+    let query = 'SELECT * FROM clientes';
+    const params: unknown[] = [];
+    const whereClauses: string[] = [];
+
+    if (search) {
+      whereClauses.push('(nome_completo ILIKE $1 OR cpf ILIKE $1 OR puf ILIKE $1)');
+      params.push(`%${search}%`);
+    }
+
+    if (userProfile === 'Atendente' && userId) {
+      whereClauses.push(`atendente_id = $${params.length + 1}`);
+      params.push(userId);
+    }
+    
+    if (whereClauses.length > 0) query += ' WHERE ' + whereClauses.join(' AND ');
+    query += ' ORDER BY nome_completo';
+    
+    console.log('Executing Query:', query, params);
+    const result = await pool.query(query, params);
+    console.log('Results Count:', result.rows.length);
+    
+    res.json(result.rows);
+  } catch (err: any) { 
+    console.error('Error in /api/clientes:', err.message);
+    res.status(500).json({ error: 'Erro ao buscar clientes' }); 
+  }
+});
+
+app.post('/api/clientes', async (req: Request, res: Response) => {
+  try {
+    const data = clienteSchema.parse(req.body);
+    const result = await pool.query(
+      `INSERT INTO clientes (nome_completo, cpf, rg, telefone_whatsapp, puf, categoria_servico, valor_contrato, status_pagamento, status_caso, notas) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [data.nome_completo, data.cpf, data.rg, data.telefone_whatsapp, data.puf, data.categoria_servico, data.valor_contrato, data.status_pagamento, data.status_caso || 'Triagem', data.notas || '']
+    );
+    res.json(result.rows[0]);
+  } catch (err: any) {
+    console.error('Error creating cliente:', err);
+    res.status(400).json({ error: err.message || 'Dados inválidos' });
+  }
+});
+
+app.put('/api/clientes/:id', async (req: Request, res: Response) => {
+  const { id } = req.params;
+  try {
+    const data = clienteSchema.parse(req.body);
+    const result = await pool.query(
+      `UPDATE clientes SET nome_completo=$1, cpf=$2, rg=$3, telefone_whatsapp=$4, puf=$5, categoria_servico=$6, valor_contrato=$7, status_pagamento=$8, status_caso=$9, notas=$10
+       WHERE id=$11 RETURNING *`,
+      [data.nome_completo, data.cpf, data.rg, data.telefone_whatsapp, data.puf, data.categoria_servico, data.valor_contrato, data.status_pagamento, data.status_caso, data.notas, id]
+    );
+    res.json(result.rows[0]);
+  } catch (err: any) { 
+    console.error('Error updating cliente:', err);
+    res.status(400).json({ error: err.message }); 
+  }
+});
+
+app.delete('/api/clientes/:id', async (req: Request, res: Response) => {
+  try {
+    await pool.query('DELETE FROM clientes WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Cliente excluído com sucesso' });
+  } catch (err) { 
+    console.error('Error deleting cliente:', err);
+    res.status(500).json({ error: 'Erro ao excluir' }); 
+  }
+});
+
+// 3. Documentos (BYTEA)
+app.get('/api/documentos/:clienteId', async (req: Request, res: Response) => {
+  const { clienteId } = req.params;
+  try {
+    const result = await pool.query(
+      'SELECT id, cliente_id, nome_arquivo, tipo_arquivo, mime_type, data_upload FROM documentos WHERE cliente_id = $1 ORDER BY data_upload DESC',
+      [clienteId]
+    );
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Erro ao buscar' }); }
+});
+
+app.post('/api/upload/:clienteId', upload.single('arquivo'), async (req: Request, res: Response) => {
+  const { clienteId } = req.params;
+  const file = req.file;
+  if (!file) return res.status(400).json({ error: 'Nenhum arquivo enviado' });
+
+  const ext = path.extname(file.originalname).toLowerCase();
+  let tipo: 'PDF' | 'IMG' | 'MP4' | 'AUDIO' = 'PDF';
+  if (['.jpg', '.jpeg', '.png', '.gif'].includes(ext)) tipo = 'IMG';
+  else if (['.mp4', '.mov'].includes(ext)) tipo = 'MP4';
+  else if (['.mp3', '.wav', '.ogg'].includes(ext)) tipo = 'AUDIO';
+
+  try {
+    const result = await pool.query(
+      'INSERT INTO documentos (cliente_id, nome_arquivo, tipo_arquivo, mime_type, arquivo_binario, url_storage) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, nome_arquivo',
+      [clienteId, file.originalname, tipo, file.mimetype, file.buffer, 'DATABASE_BIN']
+    );
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Erro no upload' }); }
+});
+
+app.get('/api/documentos/download/:id', async (req: Request, res: Response) => {
+    const { id } = req.params;
+    try {
+        const result = await pool.query('SELECT arquivo_binario, mime_type, nome_arquivo FROM documentos WHERE id = $1', [id]);
+        if (result.rows.length === 0) return res.status(404).send('Not Found');
+        const doc = result.rows[0];
+        
+        res.setHeader('Content-Type', doc.mime_type || 'application/octet-stream');
+        res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(doc.nome_arquivo)}"`);
+        res.setHeader('Cache-Control', 'public, max-age=3600');
+        res.send(doc.arquivo_binario);
+    } catch (err) { res.status(500).send('Error'); }
+});
+
+app.delete('/api/documentos/:id', async (req: Request, res: Response) => {
+  try {
+    await pool.query('DELETE FROM documentos WHERE id = $1', [req.params.id]);
+    res.json({ message: 'Excluído' });
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+// 4. Dashboards Aggregation (Fixed shadowing issue and added number casting)
+app.get('/api/dashboard/aggregate', async (req: AuthRequest, res: Response) => {
+    try {
+        const userId = req.user?.id;
+        const userProfile = req.user?.perfil;
+        console.log('--- DASHBOARD AGGREGATE ---');
+        console.log('User:', { userId, userProfile });
+
+        let filter = '';
+        const params: any[] = [];
+
+        if (userProfile === 'Atendente') {
+            filter = 'WHERE atendente_id = $1';
+            params.push(userId);
+        }
+
+        const statsArea = await pool.query(`SELECT categoria_servico as name, COUNT(*)::INTEGER as value FROM clientes ${filter} GROUP BY categoria_servico`, params);
+        const statsStatus = await pool.query(`SELECT status_caso as name, COUNT(*)::INTEGER as value FROM clientes ${filter} GROUP BY status_caso`, params);
+
+        console.log('Results Area:', statsArea.rows.length);
+        console.log('Results Status:', statsStatus.rows.length);
+
+        res.json({ 
+          area: statsArea.rows.map(r => ({ ...r, value: Number(r.value) })), 
+          status: statsStatus.rows.map(r => ({ ...r, value: Number(r.value) })) 
+        });
+    } catch (err: any) { 
+      console.error('Error in /api/dashboard/aggregate:', err.message);
+      res.status(500).json({ error: 'Erro ao consolidar dashboard' }); 
+    }
+});
+
+// 5. Undo Rollback
+app.post('/api/logs/undo/:id', async (req: AuthRequest, res: Response) => {
+    if (req.user?.perfil !== 'Admin' && req.user?.perfil !== 'Jadiel') return res.status(403).json({ error: 'Apenas Admin pode reverter' });
+    
+    const { id } = req.params;
+    try {
+        const logRes = await pool.query('SELECT * FROM logs_atividades WHERE id = $1', [id]);
+        if (logRes.rows.length === 0) return res.status(404).json({ error: 'Log não encontrado' });
+        
+        const log = logRes.rows[0];
+        if (!log.dados_antigos) return res.status(400).json({ error: 'Nenhum dado anterior para restaurar' });
+
+        const { tabela_afetada, acao, dados_antigos } = log;
+        
+        if (acao === 'UPDATE' || acao === 'DELETE') {
+            const keys = Object.keys(dados_antigos);
+            const values = Object.values(dados_antigos);
+            const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
+            const updateSet = keys.map((k, i) => `${k}=$${i + 1}`).join(', ');
+
+            if (acao === 'UPDATE') {
+                await pool.query(`UPDATE ${tabela_afetada} SET ${updateSet} WHERE id = $${keys.length + 1}`, [...values, dados_antigos.id]);
+            } else if (acao === 'DELETE') {
+                await pool.query(`INSERT INTO ${tabela_afetada} (${keys.join(', ')}) VALUES (${placeholders})`, values);
+            }
+            res.json({ success: true, message: 'Ação revertida com sucesso' });
+        } else {
+            res.status(400).json({ error: 'Não é possível reverter INSERT desta forma' });
+        }
+    } catch (err: any) { res.status(500).json({ error: 'Erro ao reverter: ' + err.message }); }
+});
+
+app.get('/api/logs', async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query(`SELECT l.*, u.nome as usuario_nome FROM logs_atividades l JOIN usuarios u ON l.usuario_id = u.id ORDER BY l.data_hora DESC LIMIT 100`);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+app.get('/api/stats', async (req: AuthRequest, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    const userProfile = req.user?.perfil;
+    console.log('--- STATS REQUEST ---');
+    console.log('User:', { userId, userProfile });
+
+    let totalClientes, faturamento, saldo, despesas;
+    if (userProfile === 'Atendente') {
+      totalClientes = await pool.query('SELECT COUNT(*) FROM clientes WHERE atendente_id = $1', [userId]);
+      faturamento = await pool.query('SELECT SUM(valor_contrato) FROM clientes WHERE atendente_id = $1', [userId]);
+      saldo = await pool.query("SELECT SUM(valor) FROM transacoes WHERE tipo = 'Entrada' AND cliente_id IN (SELECT id FROM clientes WHERE atendente_id = $1)", [userId]);
+      despesas = { rows: [{ sum: '0' }] };
+    } else {
+      totalClientes = await pool.query('SELECT COUNT(*) FROM clientes');
+      faturamento = await pool.query('SELECT SUM(valor_contrato) FROM clientes');
+      saldo = await pool.query("SELECT SUM(valor) FROM transacoes WHERE tipo = 'Entrada'");
+      despesas = await pool.query("SELECT SUM(valor) FROM transacoes WHERE tipo = 'Saída'");
+    }
+
+    const payload = {
+      totalClientes: parseInt(totalClientes.rows[0].count),
+      faturamento: parseFloat(faturamento.rows[0].sum || '0'),
+      saldo: parseFloat(saldo.rows[0].sum || '0') - parseFloat(despesas.rows[0].sum || '0')
+    };
+    console.log('Stats Payload:', payload);
+    res.json(payload);
+  } catch (err: any) { 
+    console.error('Error in /api/stats:', err.message);
+    res.status(500).json({ error: 'Erro' }); 
+  }
+});
+
+app.get('/api/transacoes', async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query(`SELECT t.*, c.nome_completo as nome_cliente FROM transacoes t LEFT JOIN clientes c ON t.cliente_id = c.id ORDER BY t.data_transacao DESC LIMIT 50`);
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+app.post('/api/transacoes', async (req: Request, res: Response) => {
+  const { cliente_id, descricao, valor, tipo } = req.body;
+  try {
+    const result = await pool.query('INSERT INTO transacoes (cliente_id, descricao, valor, tipo) VALUES ($1, $2, $3, $4) RETURNING *', [cliente_id || null, descricao, valor, tipo]);
+    res.json(result.rows[0]);
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+app.get('/api/usuarios', async (req: Request, res: Response) => {
+  try {
+    const result = await pool.query('SELECT id, nome, email, perfil, meta_faturamento FROM usuarios ORDER BY nome');
+    res.json(result.rows);
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+app.post('/api/usuarios', async (req: Request, res: Response) => {
+  const { nome, email, senha, perfil, meta_faturamento } = req.body;
+  try {
+    const result = await pool.query('INSERT INTO usuarios (nome, email, senha, perfil, meta_faturamento) VALUES ($1, $2, $3, $4, $5) RETURNING id, nome, email, perfil, meta_faturamento', [nome, email, senha, perfil, meta_faturamento || 0]);
+    res.json(result.rows[0]);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/usuarios/:id', async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { nome, email, perfil, meta_faturamento } = req.body;
+  try {
+    await pool.query('UPDATE usuarios SET nome = $1, email = $2, perfil = $3, meta_faturamento = $4 WHERE id = $5', [nome, email, perfil, meta_faturamento, id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+app.delete('/api/usuarios/:id', async (req: Request, res: Response) => {
+  try {
+    await pool.query('DELETE FROM usuarios WHERE id = $1', [req.params.id]);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Erro' }); }
+});
+
+app.listen(port, () => {
+  console.log(`Servidor rodando em http://localhost:${port}`);
+});
